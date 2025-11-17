@@ -1,56 +1,3 @@
-"""
-Transformer Architecture with Mixture of Experts Support
-
-This module implements a GPT-style transformer model with optional Mixture of Experts (MoE)
-layers for conditional computation. The architecture supports flexible configuration of MoE
-layers at specific depths, enabling efficient scaling while maintaining performance.
-
-Classes:
-    MultiHeadAttention: Implements scaled dot-product multi-head attention mechanism
-    DenseFFN: Standard feed-forward network with GELU activation
-    TransformerBlock: Complete transformer block with attention and FFN/MoE layers
-    GPTModel: Full GPT-style autoregressive language model with causal masking
-
-Key Features:
-    - Causal (autoregressive) attention masking for language modeling
-    - Optional Mixture of Experts layers at configurable depths
-    - Load balancing loss for MoE layers to encourage expert diversity
-    - Expert usage tracking and statistics
-    - Positional embeddings for sequence position encoding
-
-Example:
-    >>> model = GPTModel(
-    ...     vocab_size=50000,
-    ...     hidden_dim=512,
-    ...     num_layers=6,
-    ...     num_heads=8,
-    ...     ffn_dim=2048,
-    ...     moe_layers=[2, 4],
-    ...     num_experts=8,
-    ...     load_balance_weight=0.01
-    ... )
-    >>> input_ids = torch.randint(0, 50000, (2, 128))
-    >>> logits, loss, aux_loss = model(input_ids)
-
-    Using MoE layers:
-    >>> usage = model.get_expert_usage()
-    >>> print(f"Layer 2 expert usage: {usage[2]}")
-    >>> model.reset_expert_counts()
-
-Dependencies:
-    - torch: PyTorch deep learning framework
-    - moe: Custom MoE layer implementation
-
-Notes:
-    - The model uses pre-normalization (LayerNorm before sublayers)
-    - Dropout is applied after attention and FFN outputs
-    - MoE auxiliary loss is automatically added to the main loss when targets are provided
-    - Expert usage statistics accumulate across forward passes until reset
-
-Author: MoE Router Project
-License: MIT
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -130,6 +77,8 @@ class TransformerBlock(nn.Module):
         num_experts: int = 8,
         load_balance_weight: float = 0.01,
         top_k: int = 1,
+        capacity_factor: float = 1.25,
+        gating_temperature: float = 1.0,
     ):
         super().__init__()
         self.use_moe = use_moe
@@ -140,7 +89,8 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_dim)
         if use_moe:
             self.ffn = MoELayer(
-                hidden_dim, num_experts, ffn_dim, dropout, load_balance_weight, top_k
+                hidden_dim, num_experts, ffn_dim, dropout, load_balance_weight, top_k,
+                capacity_factor, gating_temperature
             )
         else:
             self.ffn = DenseFFN(hidden_dim, ffn_dim, dropout)
@@ -172,10 +122,14 @@ class GPTModel(nn.Module):
         num_experts: int = 8,
         load_balance_weight: float = 0.01,
         top_k: int = 1,
+        capacity_factor: float = 1.25,
+        gating_temperature: float = 1.0,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
+        self.label_smoothing = label_smoothing
 
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_seq_len, hidden_dim)
@@ -194,6 +148,8 @@ class GPTModel(nn.Module):
                     num_experts=num_experts,
                     load_balance_weight=load_balance_weight,
                     top_k=top_k,
+                    capacity_factor=capacity_factor,
+                    gating_temperature=gating_temperature,
                 )
                 for i in range(num_layers)
             ]
@@ -230,7 +186,11 @@ class GPTModel(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1),
+                label_smoothing=self.label_smoothing
+            )
             loss = loss + total_aux_loss
 
         return logits, loss, total_aux_loss
@@ -241,8 +201,20 @@ class GPTModel(nn.Module):
             if block.use_moe:
                 usage[i] = block.ffn.get_expert_usage()
         return usage
+    
+    def get_expert_statistics(self) -> Dict[int, Dict]:
+        stats = {}
+        for i, block in enumerate(self.blocks):
+            if block.use_moe:
+                stats[i] = block.ffn.get_expert_statistics()
+        return stats
 
     def reset_expert_counts(self):
         for block in self.blocks:
             if block.use_moe:
                 block.ffn.reset_expert_counts()
+    
+    def set_gating_temperature(self, temperature: float):
+        for block in self.blocks:
+            if block.use_moe:
+                block.ffn.set_gating_temperature(temperature)

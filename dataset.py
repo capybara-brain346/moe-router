@@ -1,69 +1,6 @@
-"""
-WikiText Dataset Loading and Preprocessing
-
-This module provides utilities for loading and preprocessing the WikiText-2 dataset
-for language modeling tasks. It supports multiple tokenization strategies and handles
-automatic downloading, caching, and fallback to synthetic data.
-
-Classes:
-    WikiTextDataset: PyTorch Dataset for sequence-to-sequence language modeling
-
-Functions:
-    load_wikitext_data: Load and tokenize WikiText-2 dataset with configurable options
-
-Key Features:
-    - Multiple tokenization strategies (tiktoken, character-level, whitespace)
-    - Automatic dataset downloading from HuggingFace Hub
-    - Local caching to avoid repeated downloads
-    - Automatic fallback to synthetic data if download fails
-    - Sliding window approach for sequence generation
-    - Automatic padding for incomplete sequences
-
-Tokenization Strategies:
-    tiktoken: Uses OpenAI's GPT-2 tokenizer (50,257 tokens)
-    char: Character-level tokenization with vocabulary from training data
-    whitespace: Simple whitespace tokenizer with configurable vocabulary size
-
-Example:
-    >>> from dataset import load_wikitext_data, WikiTextDataset
-    >>> from torch.utils.data import DataLoader
-    >>>
-    >>> train_tokens, val_tokens, vocab_size = load_wikitext_data(
-    ...     seq_len=256,
-    ...     vocab_size=10000,
-    ...     tokenizer_type="tiktoken",
-    ...     data_dir="./wikitext"
-    ... )
-    >>>
-    >>> train_dataset = WikiTextDataset(train_tokens, seq_len=256)
-    >>> train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    >>>
-    >>> for inputs, targets in train_loader:
-    ...     print(f"Input shape: {inputs.shape}")
-    ...     print(f"Target shape: {targets.shape}")
-    ...     break
-
-Dependencies:
-    - torch: PyTorch for tensor operations and Dataset class
-    - polars: Fast DataFrame library for reading Parquet files
-    - huggingface_hub: Dataset downloading from HuggingFace Hub
-    - tiktoken: OpenAI's tokenizer (optional, for tiktoken mode)
-
-Notes:
-    - The dataset uses a sliding window approach without overlap
-    - Each sample returns (input_sequence, target_sequence) where targets are shifted by 1
-    - Incomplete sequences at the end are padded with zeros
-    - Downloaded files are cached locally to avoid repeated downloads
-    - If download fails, synthetic random data is generated automatically
-
-Author: MoE Router Project
-License: MIT
-"""
-
 import torch
 from torch.utils.data import Dataset
 import polars as pl
-from typing import Literal
 from pathlib import Path
 import tiktoken
 

@@ -1,73 +1,3 @@
-"""
-Mixture of Experts (MoE) Layer Implementation
-
-This module implements a sparse Mixture of Experts layer for conditional computation
-in neural networks. The MoE layer routes each token to a single expert (top-1 routing)
-based on learned routing probabilities, enabling efficient scaling of model capacity.
-
-Classes:
-    ExpertMLP: Individual expert network with two-layer MLP architecture
-    MoELayer: Sparse MoE layer with top-1 routing and load balancing
-
-Key Features:
-    - Top-1 expert routing (each token processed by one expert)
-    - Load balancing auxiliary loss to prevent expert collapse
-    - Expert usage tracking for monitoring and analysis
-    - Weighted expert outputs based on router confidence
-    - Efficient batched computation per expert
-
-Routing Mechanism:
-    The router is a learned linear projection that computes logits for each expert.
-    Softmax converts logits to probabilities, and the expert with highest probability
-    is selected for each token. The expert output is weighted by the router probability
-    to maintain gradient flow through the routing decision.
-
-Load Balancing:
-    An auxiliary loss encourages uniform expert utilization by penalizing the product
-    of mean router probabilities and actual expert frequencies. This prevents the
-    routing network from collapsing to use only a few experts.
-
-Example:
-    >>> import torch
-    >>> from moe import MoELayer
-    >>>
-    >>> moe_layer = MoELayer(
-    ...     hidden_dim=512,
-    ...     num_experts=8,
-    ...     ffn_dim=2048,
-    ...     dropout=0.1,
-    ...     load_balance_weight=0.01
-    ... )
-    >>>
-    >>> x = torch.randn(2, 128, 512)
-    >>> output, aux_loss = moe_layer(x)
-    >>> print(f"Output shape: {output.shape}")
-    >>> print(f"Auxiliary loss: {aux_loss.item():.4f}")
-    >>>
-    >>> usage = moe_layer.get_expert_usage()
-    >>> print(f"Expert usage: {usage}")
-
-Dependencies:
-    - torch: PyTorch deep learning framework
-
-Notes:
-    - Expert selection uses argmax, which is non-differentiable but weighted by
-      differentiable router probabilities
-    - Expert usage statistics are only tracked during evaluation (not training)
-    - Load balance loss is scaled by num_experts to be scale-invariant
-    - The implementation processes each expert's tokens separately for memory efficiency
-    - Router has no bias term (bias=False) following common MoE practices
-
-References:
-    - Shazeer et al., "Outrageously Large Neural Networks: The Sparsely-Gated
-      Mixture-of-Experts Layer", ICLR 2017
-    - Fedus et al., "Switch Transformers: Scaling to Trillion Parameter Models
-      with Simple and Efficient Sparsity", JMLR 2022
-
-Author: MoE Router Project
-License: MIT
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,28 +24,35 @@ class MoELayer(nn.Module):
         dropout: float = 0.1,
         load_balance_weight: float = 0.01,
         top_k: int = 1,
+        capacity_factor: float = 1.25,
+        gating_temperature: float = 1.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
         self.load_balance_weight = load_balance_weight
         self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.gating_temperature = gating_temperature
 
         self.router = nn.Linear(
             hidden_dim, num_experts, bias=False
-        )  # bias is false because router needs to route according to the representation rather than additional offset
+        )
 
-        self.experts = nn.ModuleList(  # create list of experts ffns
+        self.experts = nn.ModuleList(
             [Expert(hidden_dim, ffn_dim, dropout) for _ in range(num_experts)]
         )
 
         self.expert_counts = torch.zeros(num_experts)
+        self.expert_router_probs = torch.zeros(num_experts)
+        self.num_tokens_processed = 0
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, hidden_dim = x.shape
         x_flat = x.view(-1, hidden_dim)
 
         router_logits = self.router(x_flat)
+        router_logits = router_logits / self.gating_temperature
         router_probs = F.softmax(router_logits, dim=-1)
 
         if self.top_k == 1:
@@ -146,6 +83,10 @@ class MoELayer(nn.Module):
 
                 if not self.training:
                     self.expert_counts[expert_idx] += expert_mask.sum().item()
+
+        if not self.training:
+            self.expert_router_probs += router_probs.mean(dim=0).cpu()
+            self.num_tokens_processed += x_flat.shape[0]
 
         output = output_flat.view(batch_size, seq_len, hidden_dim)
 
@@ -179,5 +120,35 @@ class MoELayer(nn.Module):
     def get_expert_usage(self) -> Dict[int, int]:
         return {i: int(count) for i, count in enumerate(self.expert_counts)}
 
+    def get_expert_statistics(self) -> Dict:
+        total_tokens = self.expert_counts.sum().item()
+        if total_tokens == 0:
+            return {
+                "usage": {i: 0 for i in range(self.num_experts)},
+                "percentages": {i: 0.0 for i in range(self.num_experts)},
+                "entropy": 0.0,
+                "min_usage_pct": 0.0,
+                "max_usage_pct": 0.0,
+            }
+
+        usage_pct = (self.expert_counts / total_tokens * 100).tolist()
+        
+        probs = self.expert_counts / total_tokens
+        probs = probs[probs > 0]
+        entropy = -(probs * torch.log(probs)).sum().item()
+
+        return {
+            "usage": {i: int(count) for i, count in enumerate(self.expert_counts)},
+            "percentages": {i: pct for i, pct in enumerate(usage_pct)},
+            "entropy": entropy,
+            "min_usage_pct": min(usage_pct),
+            "max_usage_pct": max(usage_pct),
+        }
+
     def reset_expert_counts(self):
         self.expert_counts = torch.zeros(self.num_experts)
+        self.expert_router_probs = torch.zeros(self.num_experts)
+        self.num_tokens_processed = 0
+    
+    def set_gating_temperature(self, temperature: float):
+        self.gating_temperature = temperature
